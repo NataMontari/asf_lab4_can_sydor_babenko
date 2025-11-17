@@ -1,0 +1,22 @@
+2025-11-13 00:50:21,034 [INFO] WebApp:191 - Connection restablished
+2025-11-13 00:50:24,056 [INFO] WebApp:194 - Connection lost
+2025-11-13 00:50:24,297 [INFO] WebApp:191 - Connection restablished
+2025-11-13 00:51:05,622 [INFO] McuFinderGlobals:76 - Set McuFinderConnectedMode to true
+2025-11-13 00:51:05,917 [INFO] ApiDb:448 - Save user favorites file C:\Users\semen/.stm32cubeide/favorites.mcus.txt: 0 item(s)
+2025-11-13 00:51:05,917 [INFO] ApiDb:452 - User favorites MCUs=[]
+2025-11-13 00:51:05,919 [INFO] ApiDb:448 - Save user favorites file C:\Users\semen/.stm32cubeide/favorites.boards.txt: 0 item(s)
+2025-11-13 00:51:05,919 [INFO] ApiDb:452 - User favorites Boards=[]
+2025-11-13 00:52:11,251 [INFO] WebApp:194 - Connection lost
+2025-11-13 00:52:11,445 [INFO] WebApp:191 - Connection restablished
+2025-11-13 02:15:41,686 [INFO] WebApp:194 - Connection lost
+2025-11-13 02:15:41,852 [INFO] WebApp:191 - Connection restablished
+2025-11-13 02:15:43,779 [INFO] WebApp:194 - Connection lost
+2025-11-13 02:15:43,915 [INFO] WebApp:191 - Connection restablished
+2025-11-13 03:09:24,194 [INFO] WebApp:194 - Connection lost
+2025-11-13 03:09:24,367 [INFO] WebApp:191 - Connection restablished
+2025-11-13 23:40:52,002 [INFO] WebApp:194 - Connection lost
+2025-11-13 23:40:58,567 [INFO] WebApp:191 - Connection restablished
+2025-11-13 23:41:00,643 [INFO] WebApp:194 - Connection lost
+2025-11-13 23:41:00,755 [INFO] WebApp:191 - Connection restablished
+2025-11-13 23:42:48,321 [INFO] WebApp:194 - Connection lost
+2025-11-13 23:42:48,482 [INFO] WebApp:191 - Connection restablished
