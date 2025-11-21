@@ -1,0 +1,2 @@
+../Core/Src/can_gateway.c:21:6:CAN_GW_Init	1
+../Core/Src/can_gateway.c:30:6:CAN_GW_ProcessA	6

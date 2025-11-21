@@ -1,0 +1,13 @@
+/*
+ * can_gateway.h
+ *
+ *  Created on: Nov 21, 2025
+ *      Author: semen
+ */
+
+#ifndef INC_CAN_GATEWAY_H_
+#define INC_CAN_GATEWAY_H_
+
+
+
+#endif /* INC_CAN_GATEWAY_H_ */
